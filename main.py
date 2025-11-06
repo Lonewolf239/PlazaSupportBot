@@ -1,23 +1,66 @@
 import asyncio
 import json
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+import logging
+import os
 from dataclasses import dataclass, asdict, field
+from datetime import datetime, timedelta
 from enum import Enum
+from typing import Dict, List, Optional
+import aiofiles
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, PhotoSize, Document
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-import os
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from dotenv import load_dotenv
+from messages import Messages
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
+admin_ids_str = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()] if admin_ids_str else []
 STORAGE_FILE = "chats_storage.json"
+LANGUAGES_FILE = "user_languages.json"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+MAX_MESSAGE_LENGTH = 4096
+MAX_NAME_LENGTH = 100
+CHAT_PREVIEW_LENGTH = 50
+LAST_MESSAGES_COUNT = 6
+PAGE_CHAR_LIMIT = 3900
+
+
+class LanguageManager:
+    @staticmethod
+    def load_languages() -> dict:
+        if os.path.exists(LANGUAGES_FILE):
+            with open(LANGUAGES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {}
+
+    @staticmethod
+    def save_languages(languages: dict) -> None:
+        with open(LANGUAGES_FILE, "w", encoding="utf-8") as f:
+            json.dump(languages, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def user_exists(user_id: int) -> bool:
+        languages = LanguageManager.load_languages()
+        return str(user_id) in languages
+
+    @staticmethod
+    def set_user_language(user_id: int, language: str) -> None:
+        languages = LanguageManager.load_languages()
+        languages[str(user_id)] = language
+        LanguageManager.save_languages(languages)
+
+    @staticmethod
+    def get_user_language(user_id: int, default: str = "en") -> str:
+        languages = LanguageManager.load_languages()
+        return languages.get(str(user_id), default)
 
 
 class ChatStatus(str, Enum):
@@ -25,7 +68,7 @@ class ChatStatus(str, Enum):
     CLOSED = "closed"
 
 
-def truncate_text(text: str, max_length: int = 4096) -> str:
+def truncate_text(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> str:
     """Обрезает текст до максимальной длины"""
     if not text:
         return ""
@@ -92,6 +135,7 @@ class AdvancedChatStorage:
     def __init__(self, filename: str):
         self.filename = filename
         self.chats: Dict[int, VirtualChat] = {}
+        self._lock = asyncio.Lock()
         self.load()
 
     def load(self):
@@ -104,16 +148,17 @@ class AdvancedChatStorage:
                     for user_id, chat_data in data.items()
                 }
             except Exception as e:
-                print(f"Ошибка загрузки: {e}")
+                logger.error(f"Ошибка загрузки: {e}")
                 self.chats = {}
 
-    def save(self):
-        try:
-            with open(self.filename, "w", encoding="utf-8") as f:
-                data = {str(user_id): chat.to_dict() for user_id, chat in self.chats.items()}
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"Ошибка сохранения: {e}")
+    async def save(self):  # ← async метод
+        async with self._lock:
+            try:
+                async with aiofiles.open(self.filename, "w", encoding="utf-8") as f:
+                    data = {str(user_id): chat.to_dict() for user_id, chat in self.chats.items()}
+                    await f.write(json.dumps(data, ensure_ascii=False, indent=2))
+            except Exception as e:
+                logger.error(f"Ошибка сохранения: {e}")
 
     def add_or_get_chat(self, user_id: int, user_name: str) -> VirtualChat:
         if user_id not in self.chats:
@@ -125,12 +170,12 @@ class AdvancedChatStorage:
             )
         return self.chats[user_id]
 
-    def add_message(self, user_id: int, sender_type: str, sender_id: int, sender_name: str, text: str,
+    async def add_message(self, user_id: int, sender_type: str, sender_id: int, sender_name: str, text: str,
                     media_files: List[Dict] = None):
         """Безопасно добавляет сообщение"""
         if user_id in self.chats:
             safe_text = truncate_text(text or "")
-            safe_name = (sender_name or "Пользователь")[:100]
+            safe_name = (sender_name or "Пользователь")[:MAX_NAME_LENGTH]
             msg = ChatMessage(
                 sender_type=sender_type,
                 sender_id=sender_id,
@@ -140,9 +185,9 @@ class AdvancedChatStorage:
                 media_files=media_files or []
             )
             self.chats[user_id].messages.append(msg)
-            self.save()
+            await self.save()
 
-    def get_chat_preview(self, user_id: int, max_length: int = 50) -> str:
+    def get_chat_preview(self, user_id: int, max_length: int = CHAT_PREVIEW_LENGTH) -> str:
         if user_id not in self.chats:
             return ""
         messages = self.chats[user_id].messages
@@ -159,56 +204,110 @@ class AdvancedChatStorage:
             chats = [(uid, name) for uid, name in chats if self.chats[uid].status == filter_status]
         return chats
 
-    def set_chat_status(self, user_id: int, status: str):
+    async def set_chat_status(self, user_id: int, status: str):
         if user_id in self.chats:
             self.chats[user_id].status = status
-            self.save()
+            await self.save()
 
-    def assign_admin(self, user_id: int, admin_id: int):
+    async def assign_admin(self, user_id: int, admin_id: int):
         if user_id in self.chats:
             self.chats[user_id].assigned_admin = admin_id
-            self.save()
+            await self.save()
 
     def get_unread_count(self) -> int:
         """Чаты, ждущие ответа"""
         return sum(1 for chat in self.chats.values()
                    if chat.status == ChatStatus.OPEN.value)
 
-    def get_last_messages(self, user_id: int, count: int = 6) -> List[ChatMessage]:
+    def get_last_messages(self, user_id: int, count: int = LAST_MESSAGES_COUNT) -> List[ChatMessage]:
         """Получить последние N сообщений"""
         if user_id not in self.chats:
             return []
         messages = self.chats[user_id].messages
         return messages[-count:] if len(messages) > count else messages
 
-
+language_manager = LanguageManager()
 storage = AdvancedChatStorage(STORAGE_FILE)
 
 
 @dp.message(Command("start"))
 async def start(message: Message):
     try:
-        user_id = message.from_user.id
-        if user_id in ADMIN_IDS:
-            await message.answer(
-                "👨‍💻 Панель администратора\n\n"
-                "Используйте кнопки ниже для управления чатами",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="📋 Все чаты", callback_data="admin_view_all")],
-                    [InlineKeyboardButton(text="⏳ Ожидающие ответа", callback_data="admin_view_waiting")],
-                    [InlineKeyboardButton(text="✅ Закрытые", callback_data="admin_view_closed")]
-                ])
-            )
+        user_id = message.chat.id
+        if not language_manager.user_exists(user_id):
+            await message.answer("[🤖] 👋 Hello! Choose language:", reply_markup=get_language_keyboard())
         else:
-            storage.add_or_get_chat(user_id, message.from_user.full_name)
-            storage.set_chat_status(user_id, ChatStatus.OPEN.value)
-            await message.answer(
-                "[🤖] 👋 Добро пожаловать в техподдержку!\n\n"
-                "Напишите вашу проблему, и мы вам поможем."
-            )
+            await main_menu(message)
     except Exception as e:
-        print(f"Ошибка в start: {e}")
+        logger.error(f"Ошибка в start: {e}")
+
+
+@dp.message(Command("change_language"))
+async def change_language(message: Message):
+    await message.answer("[🤖] 🌐 Choose language:", reply_markup=get_language_keyboard())
+
+
+async def main_menu(message: Message):
+    user_id = message.chat.id
+    if user_id in ADMIN_IDS:
+        await message.answer(
+            "👨‍💻 Панель администратора",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Все чаты", callback_data="admin_view_all")],
+                [InlineKeyboardButton(text="⏳ Ожидающие ответа", callback_data="admin_view_waiting")],
+                [InlineKeyboardButton(text="✅ Закрытые", callback_data="admin_view_closed")],
+                [InlineKeyboardButton(text="❓ Помощь", callback_data="help")]
+            ])
+        )
+    else:
+        storage.add_or_get_chat(user_id, message.from_user.full_name)
+        await storage.set_chat_status(user_id, ChatStatus.OPEN.value)
+        await message.answer(Messages.get_messages("MAIN", language_manager.get_user_language(user_id)))
+
+
+def get_language_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🇷🇺", callback_data="lang_ru"),
+            InlineKeyboardButton(text="🇺🇸", callback_data="lang_en"),
+        ]
+    ])
+
+
+@dp.callback_query(F.data == "help")
+async def admin_help(callback_data: CallbackQuery):
+    help_text = """👨‍💻 <b>СПРАВКА ПО БОТУ</b>
+    
+<b>📋 Основные функции:</b>
+    Просмотр всех чатов (фильтры: все/ожидающие/закрытые)
+    Чтение истории с пагинацией
+    📸 Просмотр фото/📄 документов
+    💬 Отправка ответов (текст/фото/документы)
+    Управление статусом (закрыть/открыть)
+    Обновление чатов в реальном времени
+
+<b>🤖 Автоматика:</b>
+    Автозакрытие неактивных за 2 дня
+    Удаление закрытых за 2 недели
+    Уведомления о новых сообщениях
+
+<b>💾 Данные:</b>
+    Полная история чатов (JSON)
+    Все медиафайлы сохраняются
+    Информация не теряется при перезагрузке
+
+<i>Все функции доступны через кнопки в панели.</i>
+    """
+    await callback_data.message.answer(help_text, parse_mode="HTML", reply_markup=get_delete_keyboard())
+
+
+@dp.callback_query(F.data.in_(["lang_ru", "lang_en"]))
+async def set_language(callback: CallbackQuery):
+    language = callback.data.split("_")[1]
+    language_manager.set_user_language(callback.from_user.id, language)
+    await callback.message.delete()
+    await main_menu(callback.message)
 
 
 async def notify_admins_about_message(user_id: int, user_name: str):
@@ -227,106 +326,79 @@ async def notify_admins_about_message(user_id: int, user_name: str):
                 ])
             )
         except Exception as e:
-            print(f"Ошибка отправки уведомления админу {admin_id}: {e}")
+            logger.error(f"Ошибка отправки уведомления админу {admin_id}: {e}")
 
 
 @dp.message(StateFilter(None), F.from_user.id.not_in(ADMIN_IDS), F.photo)
 async def user_photo(message: Message):
-    try:
-        user_id = message.from_user.id
-        chat = storage.add_or_get_chat(user_id, message.from_user.full_name)
-        was_closed = chat.status == ChatStatus.CLOSED.value
-        if was_closed:
-            storage.set_chat_status(user_id, ChatStatus.OPEN.value)
-        photo = message.photo[-1]
-        caption = message.caption or ""
-        storage.add_message(
-            user_id=user_id,
-            sender_type="user",
-            sender_id=message.from_user.id,
-            sender_name=message.from_user.full_name,
-            text=caption,
-            media_files=[{
-                "type": "photo",
-                "file_id": photo.file_id,
-                "file_unique_id": photo.file_unique_id,
-                "caption": caption
-            }]
-        )
-        if was_closed:
-            await message.answer(
-                "[🤖] 🔄 Ваш чат был закрыт. Он открыт заново.\n"
-                "✅ Ваше фото отправлено в техподдержку\n"
-                "⏳ Ожидайте ответа..."
-            )
-        await notify_admins_about_message(user_id, message.from_user.full_name)
-    except Exception as e:
-        print(f"Ошибка в user_photo: {e}")
-        await message.answer("❌ Ошибка при обработке фото")
+    await process_user_message(message, media_type="photo")
 
 
 @dp.message(StateFilter(None), F.from_user.id.not_in(ADMIN_IDS), F.document)
 async def user_document(message: Message):
-    try:
-        user_id = message.from_user.id
-        chat = storage.add_or_get_chat(user_id, message.from_user.full_name)
-        was_closed = chat.status == ChatStatus.CLOSED.value
-        if was_closed:
-            storage.set_chat_status(user_id, ChatStatus.OPEN.value)
-        doc = message.document
-        caption = message.caption or ""
-        storage.add_message(
-            user_id=user_id,
-            sender_type="user",
-            sender_id=message.from_user.id,
-            sender_name=message.from_user.full_name,
-            text=caption,
-            media_files=[{
-                "type": "document",
-                "file_id": doc.file_id,
-                "file_unique_id": doc.file_unique_id,
-                "file_name": doc.file_name or "Документ",
-                "caption": caption
-            }]
-        )
-        if was_closed:
-            await message.answer(
-                "[🤖] 🔄 Ваш чат был закрыт. Он открыт заново.\n"
-                "✅ Ваш документ отправлен в техподдержку\n"
-                "⏳ Ожидайте ответа..."
-            )
-        await notify_admins_about_message(user_id, message.from_user.full_name)
-    except Exception as e:
-        print(f"Ошибка в user_document: {e}")
-        await message.answer("❌ Ошибка при обработке документа")
+    await process_user_message(message, media_type="document")
 
 
 @dp.message(StateFilter(None), F.from_user.id.not_in(ADMIN_IDS))
 async def user_message(message: Message):
+    await process_user_message(message)
+
+
+async def process_user_message(message: Message, media_type: str = None):
+    """
+    Unified handler for user messages, photos, and documents.
+
+    Args:
+        message: The Telegram message object
+        media_type: Type of media ("photo", "document", or None for text)
+    """
+    error_message = "❌ Ошибка при обработке сообщения"
     try:
-        user_id = message.from_user.id
-        text = message.text or ""
+        user_id = message.chat.id
         chat = storage.add_or_get_chat(user_id, message.from_user.full_name)
         was_closed = chat.status == ChatStatus.CLOSED.value
+        is_first_message = len(chat.messages) == 0
+
         if was_closed:
-            storage.set_chat_status(user_id, ChatStatus.OPEN.value)
-        storage.add_message(
-            user_id=user_id,
-            sender_type="user",
-            sender_id=user_id,
-            sender_name=message.from_user.full_name,
-            text=text
-        )
+            await storage.set_chat_status(user_id, ChatStatus.OPEN.value)
+        media_files = []
+        text = message.text or message.caption or "(пусто)"
+        if media_type == "photo":
+            photo = message.photo[-1]
+            media_files = [{
+                "type": "photo",
+                "file_id": photo.file_id,
+                "file_unique_id": photo.file_unique_id,
+                "caption": text
+            }]
+            error_message = "❌ Ошибка при обработке фото"
+        elif media_type == "document":
+            doc = message.document
+            media_files = [{
+                "type": "document",
+                "file_id": doc.file_id,
+                "file_unique_id": doc.file_unique_id,
+                "file_name": doc.file_name or "Документ",
+                "caption": text
+            }]
+            error_message = "❌ Ошибка при обработке документа"
         if was_closed:
-            await message.answer(
-                "[🤖] 🔄 Ваш чат был закрыт. Он открыт заново.\n"
-                "✅ Ваше новое сообщение отправлено в техподдержку\n"
-                "⏳ Ожидайте ответа..."
-            )
-        await notify_admins_about_message(user_id, message.from_user.full_name)
+            await message.answer(Messages.get_messages("CHAT_CLOSED", language_manager.get_user_language(user_id)))
+        if was_closed or is_first_message:
+            await notify_admins_about_message(user_id, message.from_user.full_name)
     except Exception as e:
-        print(f"Ошибка в user_message: {e}")
-        await message.answer("❌ Ошибка при обработке сообщения")
+        logger.error(f"Ошибка при обработке сообщения: {e}")
+        await message.answer(error_message)
+        return
+
+    await storage.add_message(
+        user_id=user_id,
+        sender_type="user",
+        sender_id=message.chat.id,
+        sender_name=message.from_user.full_name,
+        text=text,
+        media_files=media_files if media_files else None
+    )
 
 
 def get_chats_keyboard(chats_list: List[tuple], page: int = 0, per_page: int = 5) -> InlineKeyboardMarkup:
@@ -361,7 +433,6 @@ def get_delete_keyboard():
 @dp.callback_query(F.data == "delete_message")
 async def delete_message_handler(query: CallbackQuery):
     await query.message.delete()
-    await query.answer()
 
 
 @dp.callback_query(F.data == "admin_menu")
@@ -374,12 +445,13 @@ async def admin_menu(query: CallbackQuery, state: FSMContext):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📋 Все чаты", callback_data="admin_view_all")],
                 [InlineKeyboardButton(text="⏳ Ожидающие ответа", callback_data="admin_view_waiting")],
-                [InlineKeyboardButton(text="✅ Закрытые", callback_data="admin_view_closed")]
+                [InlineKeyboardButton(text="✅ Закрытые", callback_data="admin_view_closed")],
+                [InlineKeyboardButton(text="❓ Помощь", callback_data="help")]
             ])
         )
         await query.answer()
     except Exception as e:
-        print(f"Ошибка в admin_menu: {e}")
+        logger.error(f"Ошибка в admin_menu: {e}")
 
 
 @dp.callback_query(F.data == "admin_view_all")
@@ -399,7 +471,7 @@ async def admin_view_all(query: CallbackQuery, state: FSMContext):
         )
         await query.answer()
     except Exception as e:
-        print(f"Ошибка в admin_view_all: {e}")
+        logger.error(f"Ошибка в admin_view_all: {e}")
 
 
 @dp.callback_query(F.data == "admin_view_waiting")
@@ -418,7 +490,7 @@ async def admin_view_waiting(query: CallbackQuery, state: FSMContext):
         )
         await query.answer()
     except Exception as e:
-        print(f"Ошибка в admin_view_waiting: {e}")
+        logger.error(f"Ошибка в admin_view_waiting: {e}")
 
 
 @dp.callback_query(F.data == "admin_view_closed")
@@ -437,7 +509,7 @@ async def admin_view_closed(query: CallbackQuery, state: FSMContext):
         )
         await query.answer()
     except Exception as e:
-        print(f"Ошибка в admin_view_closed: {e}")
+        logger.error(f"Ошибка в admin_view_closed: {e}")
 
 
 @dp.callback_query(F.data.startswith("page_all_"))
@@ -449,10 +521,10 @@ async def admin_change_page(query: CallbackQuery):
         await query.message.edit_reply_markup(reply_markup=keyboard)
         await query.answer()
     except Exception as e:
-        print(f"Ошибка в admin_change_page: {e}")
+        logger.error(f"Ошибка в admin_change_page: {e}")
 
 
-def build_chat_display_text(chat: VirtualChat, page: int = 0, char_limit: int = 4000) -> tuple[str, int]:
+def build_chat_display_text(chat: VirtualChat, page: int = 0, char_limit: int = PAGE_CHAR_LIMIT) -> tuple[str, int]:
     """
     Формирует текст отображения чата с глобальной нумерацией медиа и пагинацией.
     Разбивает чат на страницы если больше char_limit символов.
@@ -479,18 +551,18 @@ def build_chat_display_text(chat: VirtualChat, page: int = 0, char_limit: int = 
                 for media in msg.media_files:
                     if media["type"] == "photo":
                         photo_count += 1
-                        media_info += f"📷 Изображение №{photo_count}\n"
+                        media_info += f"📷 Изображение №{photo_count}"
                     elif media["type"] == "document":
                         doc_count += 1
-                        media_info += f"📄 {media.get('file_name', 'Документ')} №{doc_count}\n"
+                        media_info += f"📄 {media.get('file_name', 'Документ')} №{doc_count}"
                 text_content = (text_content + "\n" if text_content else "") + media_info
             full_text += f"{sender_label} {msg.sender_name} ({time}):\n{text_content}\n\n"
         except Exception as e:
-            print(f"Ошибка форматирования сообщения: {e}")
+            logger.error(f"Ошибка форматирования сообщения: {e}")
             continue
     header = f"💬 {chat.user_name}\n"
     header += f"Статус: {'🟢 Открыт' if chat.status == ChatStatus.OPEN else '🔴 Закрыт'}\n"
-    header += "═" * 32 + "\n\n"
+    header += "═" * 24 + "\n\n"
     total_text = header + full_text
     if len(total_text) <= char_limit:
         return truncate_text(total_text), 1
@@ -505,6 +577,9 @@ def build_chat_display_text(chat: VirtualChat, page: int = 0, char_limit: int = 
                 if current_page_text:
                     pages.append(header + current_page_text)
                 current_page_text = line + "\n\n"
+    closed_message = "\n\n🔴 Чат закрыт администратором"
+    if chat.status == ChatStatus.OPEN:
+        closed_message = ""
     if current_page_text:
         pages.append(header + current_page_text)
     if not pages:
@@ -513,33 +588,28 @@ def build_chat_display_text(chat: VirtualChat, page: int = 0, char_limit: int = 
     if page >= total_pages:
         page = total_pages - 1
     page_text = pages[page]
-    page_text += f"\n\n📄 Страница {page + 1}/{total_pages}"
-    return truncate_text(page_text), total_pages
+    return truncate_text(page_text) + closed_message, total_pages
 
 
 def build_last_messages_preview(messages: List[ChatMessage]) -> str:
-    """Формирует текст с последними 6 сообщениями для предпросмотра"""
+    """Формирует текст с последними LAST_MESSAGES_COUNT сообщениями для предпросмотра"""
     if not messages:
-        return "<b>📋 История чата (последние 6 сообщений):</b>\n\n<i>(сообщений нет)</i>"
-    text = "<b>📋 История чата (последние 6 сообщений):</b>\n"
-    text += "=" * 32 + "\n\n"
+        return f"<b>📋 История чата (последние {LAST_MESSAGES_COUNT} сообщений):</b>\n\n<i>(сообщений нет)</i>"
+    text = f"<b>📋 История чата (последние {LAST_MESSAGES_COUNT} сообщений):</b>\n"
+    text += "=" * 24 + "\n\n"
     for msg in messages:
         sender_label = "👤 Пользователь" if msg.sender_type == "user" else "🔧 Администратор"
         text += f"<b>{sender_label}</b> [{msg.timestamp}]\n"
-
         if msg.text:
             text += f"{msg.text}\n"
-
         if msg.media_files:
             for media in msg.media_files:
                 if media['type'] == 'photo':
-                    text += "[🖼️ Фото]\n"
+                    text += "[📷 Изображение]\n"
                 elif media['type'] == 'document':
                     text += f"[📄 {media.get('file_name', 'Документ')}]\n"
-
         text += "\n"
-
-    text += "=" * 32 + "\n"
+    text += "=" * 24 + "\n"
     return text
 
 
@@ -596,7 +666,7 @@ async def change_chat_page(query: CallbackQuery, state: FSMContext):
         await query.message.edit_text(messages_text, reply_markup=keyboard, parse_mode="HTML")
         await query.answer()
     except Exception as e:
-        print(f"Ошибка в change_chat_page: {e}")
+        logger.error(f"Ошибка в change_chat_page: {e}")
 
 
 @dp.callback_query(F.data == "noop")
@@ -623,7 +693,7 @@ async def admin_view_chat(query: CallbackQuery, state: FSMContext):
         await query.message.edit_text(messages_text, reply_markup=keyboard, parse_mode="HTML")
         await query.answer()
     except Exception as e:
-        print(f"Ошибка в admin_view_chat: {e}")
+        logger.error(f"Ошибка в admin_view_chat: {e}")
 
 
 @dp.callback_query(F.data.startswith("view_images_"))
@@ -655,7 +725,7 @@ async def view_images_menu(query: CallbackQuery, state: FSMContext):
         )
         await query.answer()
     except Exception as e:
-        print(f"Ошибка в view_images_menu: {e}")
+        logger.error(f"Ошибка в view_images_menu: {e}")
 
 
 @dp.callback_query(F.data.startswith("select_image_"))
@@ -678,7 +748,7 @@ async def select_image(query: CallbackQuery, state: FSMContext):
                 reply_markup=get_delete_keyboard()
             )
         except Exception as e:
-            print(f"Ошибка отправки изображения: {e}")
+            logger.error(f"Ошибка отправки изображения: {e}")
         await state.update_data(viewing_images=False)
         await state.set_state(SupportStates.admin_viewing_chat)
         chat = storage.chats[user_id]
@@ -689,7 +759,7 @@ async def select_image(query: CallbackQuery, state: FSMContext):
         await query.message.edit_text(messages_text, reply_markup=keyboard, parse_mode="HTML")
         await query.answer()
     except Exception as e:
-        print(f"Ошибка в select_image: {e}")
+        logger.error(f"Ошибка в select_image: {e}")
 
 
 @dp.callback_query(F.data.startswith("view_docs_"))
@@ -722,7 +792,7 @@ async def view_docs_menu(query: CallbackQuery, state: FSMContext):
         )
         await query.answer()
     except Exception as e:
-        print(f"Ошибка в view_docs_menu: {e}")
+        logger.error(f"Ошибка в view_docs_menu: {e}")
 
 
 @dp.callback_query(F.data.startswith("select_doc_"))
@@ -745,7 +815,7 @@ async def select_document(query: CallbackQuery, state: FSMContext):
                 reply_markup=get_delete_keyboard()
             )
         except Exception as e:
-            print(f"Ошибка отправки документа: {e}")
+            logger.error(f"Ошибка отправки документа: {e}")
         await state.update_data(viewing_docs=False)
         await state.set_state(SupportStates.admin_viewing_chat)
         chat = storage.chats[user_id]
@@ -756,7 +826,7 @@ async def select_document(query: CallbackQuery, state: FSMContext):
         await query.message.edit_text(messages_text, reply_markup=keyboard, parse_mode="HTML")
         await query.answer()
     except Exception as e:
-        print(f"Ошибка в select_document: {e}")
+        logger.error(f"Ошибка в select_document: {e}")
 
 
 @dp.callback_query(F.data.startswith("refresh_"))
@@ -777,40 +847,37 @@ async def refresh_chat(query: CallbackQuery, state: FSMContext):
         await query.message.edit_text(messages_text, reply_markup=keyboard, parse_mode="HTML")
         await query.answer("🔄 Чат обновлен")
     except Exception as e:
-        print(f"Ошибка в refresh_chat: {e}")
+        logger.error(f"Ошибка в refresh_chat: {e}")
 
 
 @dp.callback_query(F.data.startswith("close_"))
 async def close_chat(query: CallbackQuery):
     try:
         user_id = int(query.data.split("_")[1])
-        storage.set_chat_status(user_id, ChatStatus.CLOSED.value)
+        await storage.set_chat_status(user_id, ChatStatus.CLOSED.value)
         try:
             await bot.send_message(
-                user_id,
-                "[🤖] ❌ Ваш чат был закрыт администратором.\n"
-                "Если у вас есть еще вопросы, напишите /start чтобы создать новый чат.",
+                user_id, Messages.get_messages("CHAT_CLOSED_BY_ADMIN", language_manager.get_user_language(user_id)),
                 parse_mode="HTML"
             )
         except Exception as e:
-            print(f"Ошибка отправки уведомления пользователю: {e}")
+            logger.error(f"Ошибка отправки уведомления пользователю: {e}")
         await query.answer("✅ Чат закрыт")
         chat = storage.chats[user_id]
         messages_text, total_pages = build_chat_display_text(chat, page=0)
         last_page = total_pages - 1
         messages_text, total_pages = build_chat_display_text(chat, page=last_page)
-        messages_text += "\n\n🔴 Чат закрыт администратором"
         keyboard = build_chat_keyboard(user_id, chat_page=last_page, total_pages=total_pages)
         await query.message.edit_text(messages_text, reply_markup=keyboard, parse_mode="HTML")
     except Exception as e:
-        print(f"Ошибка в close_chat: {e}")
+        logger.error(f"Ошибка в close_chat: {e}")
 
 
 @dp.callback_query(F.data.startswith("open_"))
 async def open_chat(query: CallbackQuery):
     try:
         user_id = int(query.data.split("_")[1])
-        storage.set_chat_status(user_id, ChatStatus.OPEN.value)
+        await storage.set_chat_status(user_id, ChatStatus.OPEN.value)
         await query.answer("✅ Чат открыт")
         chat = storage.chats[user_id]
         messages_text, total_pages = build_chat_display_text(chat, page=0)
@@ -819,7 +886,7 @@ async def open_chat(query: CallbackQuery):
         keyboard = build_chat_keyboard(user_id, chat_page=last_page, total_pages=total_pages)
         await query.message.edit_text(messages_text, reply_markup=keyboard, parse_mode="HTML")
     except Exception as e:
-        print(f"Ошибка в open_chat: {e}")
+        logger.error(f"Ошибка в open_chat: {e}")
 
 
 @dp.callback_query(F.data.startswith("reply_"))
@@ -828,112 +895,45 @@ async def admin_reply_prompt(query: CallbackQuery, state: FSMContext):
         user_id = int(query.data.split("_")[1])
         await state.update_data(selected_chat_id=user_id)
         await state.set_state(SupportStates.admin_replying)
+        messages = storage.get_last_messages(user_id)
+        text = build_last_messages_preview(messages)
         await query.message.edit_text(
-            "✍️ Напишите ответ пользователю:",
+            f"{text}\n\n✍️ Напишите ответ пользователю:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="❌ Отмена", callback_data=f"chat_{user_id}_0")]
-            ])
+            ]),
+            parse_mode="HTML"
         )
         await query.answer()
     except Exception as e:
-        print(f"Ошибка в admin_reply_prompt: {e}")
+        logger.error(f"Ошибка в admin_reply_prompt: {e}")
 
 
 @dp.message(SupportStates.admin_replying, F.photo)
 async def admin_send_photo_reply(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        user_id = data.get("selected_chat_id")
-        if not user_id or user_id not in storage.chats:
-            await message.answer("❌ Ошибка: чат не найден")
-            await state.clear()
-            return
-        photo = message.photo[-1]
-        caption = message.caption or ""
-        storage.add_message(
-            user_id=user_id,
-            sender_type="admin",
-            sender_id=message.from_user.id,
-            sender_name="Администратор",
-            text=caption,
-            media_files=[{
-                "type": "photo",
-                "file_id": photo.file_id,
-                "file_unique_id": photo.file_unique_id,
-                "caption": caption
-            }]
-        )
-        try:
-            await bot.send_photo(
-                user_id,
-                photo.file_id,
-                caption=caption if caption else None
-            )
-        except Exception as e:
-            print(f"Ошибка отправки фото пользователю: {e}")
-        await state.set_state(SupportStates.admin_viewing_chat)
-        chat = storage.chats[user_id]
-        messages_text, total_pages = build_chat_display_text(chat, page=0)
-        last_page = total_pages - 1
-        messages_text, total_pages = build_chat_display_text(chat, page=last_page)
-        keyboard = build_chat_keyboard(user_id, chat_page=last_page, total_pages=total_pages)
-        await message.answer(messages_text, reply_markup=keyboard, parse_mode="HTML")
-        await state.clear()
-    except Exception as e:
-        print(f"Ошибка в admin_send_photo_reply: {e}")
-        await message.answer("❌ Произошла ошибка при отправке фото")
-        await state.clear()
+    await admin_send_reply(message, state, media_type="photo")
 
 
 @dp.message(SupportStates.admin_replying, F.document)
 async def admin_send_document_reply(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        user_id = data.get("selected_chat_id")
-        if not user_id or user_id not in storage.chats:
-            await message.answer("❌ Ошибка: чат не найден")
-            await state.clear()
-            return
-        doc = message.document
-        caption = message.caption or ""
-        storage.add_message(
-            user_id=user_id,
-            sender_type="admin",
-            sender_id=message.from_user.id,
-            sender_name="Администратор",
-            text=caption,
-            media_files=[{
-                "type": "document",
-                "file_id": doc.file_id,
-                "file_unique_id": doc.file_unique_id,
-                "file_name": doc.file_name or "Документ",
-                "caption": caption
-            }]
-        )
-        try:
-            await bot.send_document(
-                user_id,
-                doc.file_id,
-                caption=caption if caption else None
-            )
-        except Exception as e:
-            print(f"Ошибка отправки документа пользователю: {e}")
-        await state.set_state(SupportStates.admin_viewing_chat)
-        chat = storage.chats[user_id]
-        messages_text, total_pages = build_chat_display_text(chat, page=0)
-        last_page = total_pages - 1
-        messages_text, total_pages = build_chat_display_text(chat, page=last_page)
-        keyboard = build_chat_keyboard(user_id, chat_page=last_page, total_pages=total_pages)
-        await message.answer(messages_text, reply_markup=keyboard, parse_mode="HTML")
-        await state.clear()
-    except Exception as e:
-        print(f"Ошибка в admin_send_document_reply: {e}")
-        await message.answer("❌ Произошла ошибка при отправке документа")
-        await state.clear()
+    await admin_send_reply(message, state, media_type="document")
 
 
 @dp.message(SupportStates.admin_replying, F.text)
 async def admin_send_text_reply(message: Message, state: FSMContext):
+    await admin_send_reply(message, state)
+
+
+async def admin_send_reply(message: Message, state: FSMContext, media_type: str = None):
+    """
+    Unified handler for admin replies (text, photos, documents).
+
+    Args:
+        message: The Telegram message object
+        state: FSMContext for state management
+        media_type: Type of media ("photo", "document", or None for text)
+    """
+    error_message = "❌ Произошла ошибка при отправке ответа"
     try:
         data = await state.get_data()
         user_id = data.get("selected_chat_id")
@@ -941,22 +941,55 @@ async def admin_send_text_reply(message: Message, state: FSMContext):
             await message.answer("❌ Ошибка: чат не найден")
             await state.clear()
             return
-        reply_text = message.text or "(пусто)"
-        storage.add_message(
-            user_id=user_id,
-            sender_type="admin",
-            sender_id=message.from_user.id,
-            sender_name="Администратор",
-            text=reply_text
-        )
-        try:
-            await bot.send_message(
-                user_id,
-                reply_text,
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            print(f"Ошибка отправки пользователю: {e}")
+        media_files = []
+        text = message.text or message.caption or "(пусто)"
+        if media_type == "photo":
+            photo = message.photo[-1]
+            text = text
+            media_files = [{
+                "type": "photo",
+                "file_id": photo.file_id,
+                "file_unique_id": photo.file_unique_id,
+                "caption": text
+            }]
+            error_message = "❌ Произошла ошибка при отправке фото"
+            try:
+                await bot.send_photo(
+                    user_id,
+                    photo.file_id,
+                    caption=text if text else None
+                )
+            except Exception as e:
+                logger.error(f"Ошибка отправки фото пользователю: {e}")
+        elif media_type == "document":
+            doc = message.document
+            text = text
+            media_files = [{
+                "type": "document",
+                "file_id": doc.file_id,
+                "file_unique_id": doc.file_unique_id,
+                "file_name": doc.file_name or "Документ",
+                "caption": text
+            }]
+            error_message = "❌ Произошла ошибка при отправке документа"
+            try:
+                await bot.send_document(
+                    user_id,
+                    doc.file_id,
+                    caption=text if text else None
+                )
+            except Exception as e:
+                logger.error(f"Ошибка отправки документа пользователю: {e}")
+        else:
+            error_message = "❌ Произошла ошибка при отправке ответа"
+            try:
+                await bot.send_message(
+                    user_id,
+                    text,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Ошибка отправки пользователю: {e}")
         await state.set_state(SupportStates.admin_viewing_chat)
         chat = storage.chats[user_id]
         messages_text, total_pages = build_chat_display_text(chat, page=0)
@@ -966,14 +999,24 @@ async def admin_send_text_reply(message: Message, state: FSMContext):
         await message.answer(messages_text, reply_markup=keyboard, parse_mode="HTML")
         await state.clear()
     except Exception as e:
-        print(f"Ошибка в admin_send_text_reply: {e}")
-        await message.answer("❌ Произошла ошибка при отправке ответа")
+        logger.error(f"Ошибка при обработке ответа администратора: {e}")
+        await message.answer(error_message if media_type else "❌ Произошла ошибка при отправке ответа")
         await state.clear()
+        return
+
+    await storage.add_message(
+        user_id=user_id,
+        sender_type="admin",
+        sender_id=message.chat.id,
+        sender_name="Администратор",
+        text=text,
+        media_files=media_files if media_files else None
+    )
 
 
 @dp.error()
 async def error_handler(exception):
-    print(f"❌ Необработанная ошибка: {exception}")
+    logger.error(f"❌ Необработанная ошибка: {exception}")
 
 
 async def cleanup_closed_chats(storage):
@@ -988,7 +1031,7 @@ async def cleanup_closed_chats(storage):
         for uid in chats_to_delete:
             del storage.chats[uid]
         if chats_to_delete:
-            storage.save()
+            await storage.save()
         await asyncio.sleep(3600)
 
 
@@ -1000,7 +1043,7 @@ async def auto_close_inactive_chats(storage):
                 last_msg_time = datetime.strptime(chat.messages[-1].timestamp, "%d.%m.%Y %H:%M")
                 if now - last_msg_time > timedelta(days=2):
                     chat.status = ChatStatus.CLOSED.value
-                    storage.save()
+                    await storage.save()
         await asyncio.sleep(1800)
 
 
@@ -1010,7 +1053,7 @@ async def on_startup():
 
 
 async def main():
-    print("🤖 Бот техподдержки запущен...")
+    logger.info("🤖 Бот техподдержки запущен...")
     await on_startup()
     await dp.start_polling(bot)
 
