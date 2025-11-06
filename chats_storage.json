@@ -1,0 +1,18 @@
+{
+  "5971276735": {
+    "user_id": 5971276735,
+    "user_name": "Ysqaq Salakhaddin",
+    "created_at": "06.11.2025 05:03",
+    "messages": [
+      {
+        "sender_type": "user",
+        "sender_id": 5971276735,
+        "sender_name": "Ysqaq Salakhaddin",
+        "text": "Тест №5",
+        "timestamp": "06.11.2025 05:03"
+      }
+    ],
+    "status": "open",
+    "assigned_admin": null
+  }
+}
