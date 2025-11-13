@@ -27,7 +27,7 @@ class Messages:
                   "If you have any more questions, type /start to create a new chat_utils."
         },
         "HELP": {
-            "ru": "💬 <b>СПРАВКА ПО ЧАТУ</b>\n\n"
+            "ru": "<b>💬 СПРАВКА ПО ЧАТУ</b>\n\n"
                   "<b>📝 Как пользоваться:</b>\n"
                   "      Отправляйте сообщения в этот чат\n"
                   "      📸 Прикрепляйте фото и документы\n"
@@ -36,7 +36,7 @@ class Messages:
                   "      Закрытый чат: администратор завершил общение\n"
                   "      Неиспользуемый чат закроется автоматически\n\n"
                   "<i><b>Просто пишите, и вам помогут!</b></i>",
-            "en": "💬 <b>CHAT HELP</b>\n\n"
+            "en": "<b>💬 CHAT HELP</b>\n\n"
                   "<b>📝 How to use:</b>\n"
                   "      Send messages to this chat_utils\n"
                   "      📸 Attach photos and documents\n"

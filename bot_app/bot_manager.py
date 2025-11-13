@@ -2,13 +2,11 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import List
-
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
-
 from .chat_utils import ChatMessage, ChatStorage, VirtualChat, ChatStatus
 from .utils import *
 from .config import *
@@ -21,80 +19,41 @@ class SupportStates(StatesGroup):
     admin_viewing_images = State()
 
 
+# noinspection PyAsyncCall
 class BotManager:
     def __init__(self, token: str, logger: logging.Logger):
         self.bot = Bot(token=token)
         self.dp = Dispatcher()
         self.logger = logger
-
         self.language_manager = LanguageManager(LANGUAGES_FILE)
         self.storage = ChatStorage(STORAGE_FILE, self.logger)
-
         self._register_handlers()
 
     def _register_handlers(self):
         self.dp.message.register(self.start, Command("start"))
         self.dp.message.register(self.change_language, Command("change_language"))
-
         self.dp.callback_query.register(self.admin_help, F.data == "help")
         self.dp.callback_query.register(self.user_help, F.data == "user_help")
         self.dp.callback_query.register(self.set_language, F.data.in_(["lang_ru", "lang_en"]))
-
-        self.dp.message.register(
-            self.user_photo,
-            StateFilter(None),
-            F.from_user.id.not_in(ADMIN_IDS),
-            F.photo
-        )
-        self.dp.message.register(
-            self.user_document,
-            StateFilter(None),
-            F.from_user.id.not_in(ADMIN_IDS),
-            F.document
-        )
-        self.dp.message.register(
-            self.user_message,
-            StateFilter(None),
-            F.from_user.id.not_in(ADMIN_IDS)
-        )
-
+        self.dp.message.register(self.user_photo, StateFilter(None), F.from_user.id.not_in(ADMIN_IDS), F.photo)
+        self.dp.message.register(self.user_document, StateFilter(None), F.from_user.id.not_in(ADMIN_IDS), F.document)
+        self.dp.message.register(self.user_message, StateFilter(None), F.from_user.id.not_in(ADMIN_IDS))
         self.dp.callback_query.register(self.delete_message_handler, F.data == "delete_message")
-
         self.dp.callback_query.register(self.admin_menu, F.data == "admin_menu")
-
         self.dp.callback_query.register(self.admin_view_all, F.data == "admin_view_all")
         self.dp.callback_query.register(self.admin_view_waiting, F.data == "admin_view_waiting")
         self.dp.callback_query.register(self.admin_view_closed, F.data == "admin_view_closed")
-
         self.dp.callback_query.register(self.admin_change_page, F.data.startswith("page_all_"))
         self.dp.callback_query.register(self.change_chat_page, F.data.startswith("chat_page_"))
-
         self.dp.callback_query.register(self.admin_view_chat, F.data.startswith("chat_"))
-
         self.dp.callback_query.register(self.show_media_menu, F.data.startswith("show_media_"))
         self.dp.callback_query.register(self.select_media, F.data.startswith("select_media_"))
-
         self.dp.callback_query.register(self.refresh_chat, F.data.startswith("refresh_"))
         self.dp.callback_query.register(self.toggle_chat_status, F.data.startswith("toggle_chat_"))
-
         self.dp.callback_query.register(self.admin_reply_prompt, F.data.startswith("reply_"))
-
-        self.dp.message.register(
-            self.admin_send_photo_reply,
-            SupportStates.admin_replying,
-            F.photo
-        )
-        self.dp.message.register(
-            self.admin_send_document_reply,
-            SupportStates.admin_replying,
-            F.document
-        )
-        self.dp.message.register(
-            self.admin_send_text_reply,
-            SupportStates.admin_replying,
-            F.text
-        )
-
+        self.dp.message.register(self.admin_send_photo_reply, SupportStates.admin_replying, F.photo)
+        self.dp.message.register(self.admin_send_document_reply, SupportStates.admin_replying, F.document)
+        self.dp.message.register(self.admin_send_text_reply, SupportStates.admin_replying, F.text)
         self.dp.error.register(self.error_handler)
 
     async def admin_send_reply(self, message: Message, state: FSMContext, media_type: str = None):
@@ -183,7 +142,8 @@ class BotManager:
         messages_text, total_pages = self.build_chat_display_text(chat, page=0)
         last_page = total_pages - 1
         messages_text, total_pages = self.build_chat_display_text(chat, page=last_page)
-        keyboard = Keyboard.chat(self.storage, user_id, ChatStatus.OPEN.value, chat_page=last_page, total_pages=total_pages)
+        keyboard = Keyboard.chat(self.storage, user_id, ChatStatus.OPEN.value, chat_page=last_page,
+                                 total_pages=total_pages)
         await message.answer(messages_text, reply_markup=keyboard, parse_mode="HTML")
 
     async def process_user_message(self, message: Message, media_type: str = None):
@@ -434,10 +394,10 @@ class BotManager:
 
     @staticmethod
     async def admin_help(callback_data: CallbackQuery):
-        help_text = """👨‍💻 СПРАВКА ПО БОТУ
+        help_text = """
+👨‍💻 СПРАВКА ПО БОТУ
 
 📋 Основные функции:
-
 Просмотр всех чатов (фильтры: все/ожидающие/закрытые)
 Чтение истории с пагинацией
 📸 Просмотр фото/📄 документов
@@ -446,13 +406,11 @@ class BotManager:
 Обновление чатов в реальном времени
 
 🤖 Автоматика:
-
 Автозакрытие неактивных за 2 дня
 Удаление закрытых за 2 недели
 Уведомления о новых сообщениях
 
-💾 Данные:
-
+💾 Данные:W
 Полная история чатов (JSON)
 Все медиафайлы сохраняются
 Информация не теряется при перезагрузке
@@ -460,11 +418,13 @@ class BotManager:
 Все функции доступны через кнопки в панели.
 """
         await callback_data.message.answer(help_text, reply_markup=Keyboard.delete(), parse_mode="HTML")
+        await callback_data.answer()
 
     async def user_help(self, callback_data: CallbackQuery):
         help_text = Messages.get_messages("HELP",
                                           self.language_manager.get_user_language(callback_data.message.chat.id))
         await callback_data.message.answer(help_text, reply_markup=Keyboard.delete(), parse_mode="HTML")
+        await callback_data.answer()
 
     async def set_language(self, callback: CallbackQuery):
         language = callback.data.split("_")[1]
